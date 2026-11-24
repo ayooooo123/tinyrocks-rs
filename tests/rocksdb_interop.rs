@@ -293,7 +293,7 @@ fn tinyrocks_writes_and_real_rocksdb_reads_roundtrips_and_compacts_blobs() {
         .map(|e| e.metadata().unwrap().len())
         .sum();
     assert!(
-        blob_disk_bytes >= 512 * 1024 && blob_disk_bytes < 600 * 1024,
+        (512 * 1024..600 * 1024).contains(&blob_disk_bytes),
         "expected ~512 KiB of surviving blob bytes, got {blob_disk_bytes}"
     );
 
@@ -708,7 +708,7 @@ fn bench_peartube_workload_tinyrocks_vs_rocksdb() {
         for chunk in 0..5u32 {
             let mut b = WriteBatch::default();
             for i in (chunk * 1000)..((chunk + 1) * 1000) {
-                b.put_cf(cf, format!("tree/{i:06}").as_bytes(), &[0x33u8; 40]);
+                b.put_cf(cf, format!("tree/{i:06}").as_bytes(), [0x33u8; 40]);
             }
             db.write(b).unwrap();
             db.flush_cf(cf).unwrap();
