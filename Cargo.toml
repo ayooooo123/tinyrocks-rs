@@ -1,0 +1,18 @@
+[package]
+name = "tinyrocks"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.90"
+license = "MIT OR Apache-2.0"
+description = "Minimal pure-Rust RocksDB 10.x on-disk compatible LSM storage engine"
+publish = false
+
+[dependencies]
+crc32c = "0.6"
+xxhash-rust = { version = "0.8", features = ["xxh3", "xxh32", "xxh64"] }
+
+[dev-dependencies]
+rocksdb = { version = "0.24", default-features = false, features = ["snappy", "bindgen-runtime"] }
+tempfile = "3"
+
+[workspace]
