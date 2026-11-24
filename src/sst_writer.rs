@@ -5,6 +5,7 @@ use std::fs::File;
 use std::io::{BufWriter, Write};
 use std::path::Path;
 
+use crate::Result;
 use crate::bloom::BloomBuilder;
 use crate::coding::{
     ChecksumType, CompressionType, checksum_modifier_for_context, compute_builtin_checksum,
@@ -13,7 +14,6 @@ use crate::coding::{
 use crate::keys::{InternalKey, ParsedInternalKey, ValueType};
 use crate::range_del::RangeTombstone;
 use crate::sst::BlockHandle;
-use crate::Result;
 
 const BLOCK_BASED_TABLE_MAGIC: u64 = 0x88e2_41b7_85f4_cff7;
 const EXTENDED_MAGIC_V6: [u8; 4] = [0x3e, 0x00, 0x7a, 0x00];
@@ -120,10 +120,7 @@ pub fn write_sst(
     let mut offset = 0u64;
 
     // Non-zero per-file context checksum seed (`ChecksumModifierForContext(bcc, 0) != 0`).
-    let base_context_checksum = ((file_number as u32)
-        .wrapping_mul(0x9e37_79b1)
-        ^ 0x85eb_ca6b)
-        | 1;
+    let base_context_checksum = ((file_number as u32).wrapping_mul(0x9e37_79b1) ^ 0x85eb_ca6b) | 1;
 
     let mut data_block = BlockBuilder::new(DATA_RESTART_INTERVAL);
     let mut index_block = BlockBuilder::new(1);
@@ -145,11 +142,9 @@ pub fn write_sst(
             && data_block.current_size_estimate() + ik.user_key.len() + 8 + val.len()
                 > TARGET_DATA_BLOCK_SIZE
         {
-            let block_bytes = std::mem::replace(
-                &mut data_block,
-                BlockBuilder::new(DATA_RESTART_INTERVAL),
-            )
-            .finish();
+            let block_bytes =
+                std::mem::replace(&mut data_block, BlockBuilder::new(DATA_RESTART_INTERVAL))
+                    .finish();
             let handle = write_raw_block(
                 &mut writer,
                 &mut offset,
@@ -175,7 +170,10 @@ pub fn write_sst(
         num_entries += 1;
         raw_key_size += (ik.user_key.len() + 8) as u64;
         raw_value_size += val.len() as u64;
-        if matches!(ik.value_type, ValueType::Deletion | ValueType::SingleDeletion) {
+        if matches!(
+            ik.value_type,
+            ValueType::Deletion | ValueType::SingleDeletion
+        ) {
             num_deletions += 1;
         }
     }
@@ -240,12 +238,8 @@ pub fn write_sst(
             }
         }
         let rdel_bytes = rdel_block.finish();
-        let rdel_handle = write_raw_block(
-            &mut writer,
-            &mut offset,
-            &rdel_bytes,
-            base_context_checksum,
-        )?;
+        let rdel_handle =
+            write_raw_block(&mut writer, &mut offset, &rdel_bytes, base_context_checksum)?;
         meta_handles.insert(b"rocksdb.range_del".to_vec(), rdel_handle);
     }
 
@@ -321,7 +315,11 @@ pub fn write_sst(
 
     // 5. Write 53-byte format-v6 Footer.
     let footer_offset = offset;
-    let footer = build_v6_footer(footer_offset, metaindex_handle.size as u32, base_context_checksum);
+    let footer = build_v6_footer(
+        footer_offset,
+        metaindex_handle.size as u32,
+        base_context_checksum,
+    );
     writer.write_all(&footer)?;
     offset += FOOTER_NEW_LEN as u64;
 
@@ -339,7 +337,11 @@ pub fn write_sst(
         file_size: offset,
         smallest,
         largest,
-        smallest_seqno: if smallest_seqno == u64::MAX { 0 } else { smallest_seqno },
+        smallest_seqno: if smallest_seqno == u64::MAX {
+            0
+        } else {
+            smallest_seqno
+        },
         largest_seqno,
         oldest_blob_file_number,
         num_entries,
@@ -359,11 +361,10 @@ fn write_raw_block<W: Write>(
 ) -> Result<BlockHandle> {
     let block_offset = *offset;
     let comp = CompressionType::None as u8;
-    let checksum = compute_builtin_checksum_with_last_byte(ChecksumType::Xxh3, data, comp)
-        .wrapping_add(checksum_modifier_for_context(
-            base_context_checksum,
-            block_offset,
-        ));
+    let checksum =
+        compute_builtin_checksum_with_last_byte(ChecksumType::Xxh3, data, comp).wrapping_add(
+            checksum_modifier_for_context(base_context_checksum, block_offset),
+        );
     writer.write_all(data)?;
     writer.write_all(&[comp])?;
     writer.write_all(&checksum.to_le_bytes())?;
@@ -389,11 +390,9 @@ fn build_v6_footer(
     buf[41..45].copy_from_slice(&6u32.to_le_bytes()); // format_version = 6
     buf[45..53].copy_from_slice(&BLOCK_BASED_TABLE_MAGIC.to_le_bytes());
 
-    let checksum = compute_builtin_checksum(ChecksumType::Xxh3, &buf)
-        .wrapping_add(checksum_modifier_for_context(
-            base_context_checksum,
-            footer_offset,
-        ));
+    let checksum = compute_builtin_checksum(ChecksumType::Xxh3, &buf).wrapping_add(
+        checksum_modifier_for_context(base_context_checksum, footer_offset),
+    );
     buf[5..9].copy_from_slice(&checksum.to_le_bytes());
     buf
 }
@@ -447,10 +446,16 @@ fn build_properties_block(
     put_u64(b"rocksdb.tail.start.offset", tail_start_offset);
 
     props.insert(b"rocksdb.column.family.name", cf_name.as_bytes().to_vec());
-    props.insert(b"rocksdb.comparator", b"leveldb.BytewiseComparator".to_vec());
+    props.insert(
+        b"rocksdb.comparator",
+        b"leveldb.BytewiseComparator".to_vec(),
+    );
     props.insert(b"rocksdb.compression", b"NoCompression".to_vec());
     if filter_size > 0 {
-        props.insert(b"rocksdb.filter.policy", b"rocksdb.BuiltinBloomFilter".to_vec());
+        props.insert(
+            b"rocksdb.filter.policy",
+            b"rocksdb.BuiltinBloomFilter".to_vec(),
+        );
     }
     props.insert(b"rocksdb.merge.operator", b"nullptr".to_vec());
     props.insert(b"rocksdb.prefix.extractor.name", b"nullptr".to_vec());

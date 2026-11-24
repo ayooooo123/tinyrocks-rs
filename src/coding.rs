@@ -23,9 +23,7 @@ impl ChecksumType {
             2 => Ok(Self::XxHash),
             3 => Ok(Self::XxHash64),
             4 => Ok(Self::Xxh3),
-            other => Err(Error::Unsupported(format!(
-                "unknown checksum type {other}"
-            ))),
+            other => Err(Error::Unsupported(format!("unknown checksum type {other}"))),
         }
     }
 }

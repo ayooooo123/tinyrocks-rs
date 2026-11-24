@@ -147,9 +147,7 @@ pub fn read_records_with_valid_len(
             }
             RECORD_MIDDLE | RECORD_RECYCLABLE_MIDDLE => {
                 if !in_fragment {
-                    return Err(Error::Corruption(
-                        "log: middle record without first".into(),
-                    ));
+                    return Err(Error::Corruption("log: middle record without first".into()));
                 }
                 scratch.extend_from_slice(payload);
             }
@@ -219,10 +217,7 @@ impl<W: Write> LogWriter<W> {
 
     fn emit_physical(&mut self, rec_type: u8, fragment: &[u8]) -> Result<()> {
         let len = fragment.len() as u16;
-        let crc = mask_crc(crc32c::crc32c_append(
-            crc32c::crc32c(&[rec_type]),
-            fragment,
-        ));
+        let crc = mask_crc(crc32c::crc32c_append(crc32c::crc32c(&[rec_type]), fragment));
         let mut hdr = [0u8; HEADER_SIZE];
         hdr[0..4].copy_from_slice(&crc.to_le_bytes());
         hdr[4..6].copy_from_slice(&len.to_le_bytes());
@@ -242,4 +237,3 @@ impl<W: Write> LogWriter<W> {
         self.writer
     }
 }
-

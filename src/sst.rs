@@ -39,8 +39,8 @@ impl BlockHandle {
     fn decode(input: &mut &[u8]) -> Result<Self> {
         let offset = get_varint64(input)
             .ok_or_else(|| Error::Corruption("BlockHandle: bad offset".into()))?;
-        let size = get_varint64(input)
-            .ok_or_else(|| Error::Corruption("BlockHandle: bad size".into()))?;
+        let size =
+            get_varint64(input).ok_or_else(|| Error::Corruption("BlockHandle: bad size".into()))?;
         Ok(Self { offset, size })
     }
 }
@@ -127,11 +127,9 @@ impl Footer {
                 let mut copy = [0u8; FOOTER_NEW_LEN];
                 copy.copy_from_slice(footer_bytes);
                 copy[5..9].fill(0);
-                let computed = compute_builtin_checksum(checksum_type, &copy)
-                    .wrapping_add(checksum_modifier_for_context(
-                        base_context_checksum,
-                        footer_offset,
-                    ));
+                let computed = compute_builtin_checksum(checksum_type, &copy).wrapping_add(
+                    checksum_modifier_for_context(base_context_checksum, footer_offset),
+                );
                 if computed != stored_checksum {
                     return Err(Error::Corruption(format!(
                         "sst: v6 footer checksum mismatch (stored {stored_checksum:#x}, computed {computed:#x})"
@@ -340,16 +338,14 @@ impl SstReader {
     }
 
     /// Reads all entries whose user key falls in `[lower, upper)` (open when `None`).
-    pub fn scan_range(
-        &self,
-        lower: Option<&[u8]>,
-        upper: Option<&[u8]>,
-    ) -> Result<Vec<SstEntry>> {
+    pub fn scan_range(&self, lower: Option<&[u8]>, upper: Option<&[u8]>) -> Result<Vec<SstEntry>> {
         if self.index_entries.is_empty() {
             return Ok(Vec::new());
         }
         let start_idx = match lower {
-            Some(lo) => self.find_block_index(lo).unwrap_or(self.index_entries.len()),
+            Some(lo) => self
+                .find_block_index(lo)
+                .unwrap_or(self.index_entries.len()),
             None => 0,
         };
         let mut out = Vec::new();
@@ -419,9 +415,8 @@ fn read_block(file: &File, footer: &Footer, handle: BlockHandle) -> Result<Vec<u
 
     let data = &buf[..handle.size as usize];
     let comp_byte = buf[handle.size as usize];
-    let stored_checksum = u32::from_le_bytes(
-        buf[handle.size as usize + 1..total].try_into().unwrap(),
-    );
+    let stored_checksum =
+        u32::from_le_bytes(buf[handle.size as usize + 1..total].try_into().unwrap());
 
     if footer.checksum_type != ChecksumType::None {
         let mut expected =
@@ -462,7 +457,9 @@ fn parse_block_layout(block: &[u8]) -> Result<(&[u8], usize, usize)> {
         let num_buckets = u16::from_le_bytes(block[end - 2..end].try_into().unwrap()) as usize;
         let hash_bytes = 2 + num_buckets;
         if end < hash_bytes {
-            return Err(Error::Corruption("invalid data block hash bucket count".into()));
+            return Err(Error::Corruption(
+                "invalid data block hash bucket count".into(),
+            ));
         }
         end -= hash_bytes;
     }
@@ -496,16 +493,18 @@ fn search_data_block(block: &[u8], user_key: &[u8]) -> Result<Option<(u64, Value
     let mut left = 0usize;
     let mut right = num_restarts - 1;
     while left < right {
-        let mid = (left + right + 1) / 2;
+        let mid = (left + right).div_ceil(2);
         let off = restart_at(mid);
         if off >= entries.len() {
             return Err(Error::Corruption("restart offset out of bounds".into()));
         }
         let mut s = &entries[off..];
         let shared = get_varint32(&mut s).ok_or_else(|| Error::Corruption("bad shared".into()))?;
-        let non_shared =
-            get_varint32(&mut s).ok_or_else(|| Error::Corruption("bad non_shared".into()))? as usize;
-        let _val_len = get_varint32(&mut s).ok_or_else(|| Error::Corruption("bad val_len".into()))?;
+        let non_shared = get_varint32(&mut s)
+            .ok_or_else(|| Error::Corruption("bad non_shared".into()))?
+            as usize;
+        let _val_len =
+            get_varint32(&mut s).ok_or_else(|| Error::Corruption("bad val_len".into()))?;
         if shared != 0 || s.len() < non_shared || non_shared < 8 {
             return Err(Error::Corruption("corrupt restart key".into()));
         }

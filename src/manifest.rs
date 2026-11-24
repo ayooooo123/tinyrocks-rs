@@ -128,7 +128,8 @@ impl VersionState {
         }
         let manifest_bytes = std::fs::read(db_dir.join(manifest_name))?;
         let manifest_file_len = manifest_bytes.len();
-        let (records, manifest_valid_len) = log::read_records_with_valid_len(&manifest_bytes, true)?;
+        let (records, manifest_valid_len) =
+            log::read_records_with_valid_len(&manifest_bytes, true)?;
 
         let mut state = Self {
             column_families: HashMap::new(),
@@ -173,8 +174,8 @@ impl VersionState {
                 .map(|f| f.oldest_blob_file_number)
                 .min();
             cf.blob_files.retain(|&num, meta| {
-                let all_garbage = meta.garbage_blob_count >= meta.total_blob_count
-                    && meta.total_blob_count > 0;
+                let all_garbage =
+                    meta.garbage_blob_count >= meta.total_blob_count && meta.total_blob_count > 0;
                 if !all_garbage {
                     return true;
                 }
@@ -318,11 +319,10 @@ fn decode_version_edit(mut input: &[u8]) -> Result<VersionEdit> {
                     .ok_or_else(|| Error::Corruption("manifest: bad prev_log_number".into()))?;
             }
             TAG_NEXT_FILE_NUMBER => {
-                edit.next_file_number = Some(
-                    get_varint64(&mut input).ok_or_else(|| {
+                edit.next_file_number =
+                    Some(get_varint64(&mut input).ok_or_else(|| {
                         Error::Corruption("manifest: bad next_file_number".into())
-                    })?,
-                );
+                    })?);
             }
             TAG_LAST_SEQUENCE => {
                 edit.last_sequence = Some(
@@ -331,22 +331,20 @@ fn decode_version_edit(mut input: &[u8]) -> Result<VersionEdit> {
                 );
             }
             TAG_MIN_LOG_NUMBER_TO_KEEP => {
-                edit.min_log_number_to_keep = Some(
-                    get_varint64(&mut input).ok_or_else(|| {
-                        Error::Corruption("manifest: bad min_log_number_to_keep".into())
-                    })?,
-                );
+                edit.min_log_number_to_keep = Some(get_varint64(&mut input).ok_or_else(|| {
+                    Error::Corruption("manifest: bad min_log_number_to_keep".into())
+                })?);
             }
             TAG_MAX_COLUMN_FAMILY => {
-                edit.max_column_family = Some(
-                    get_varint32(&mut input).ok_or_else(|| {
+                edit.max_column_family =
+                    Some(get_varint32(&mut input).ok_or_else(|| {
                         Error::Corruption("manifest: bad max_column_family".into())
-                    })?,
-                );
+                    })?);
             }
             TAG_COMPACT_CURSOR => {
-                let _level = get_varint32(&mut input)
-                    .ok_or_else(|| Error::Corruption("manifest: bad compact_cursor level".into()))?;
+                let _level = get_varint32(&mut input).ok_or_else(|| {
+                    Error::Corruption("manifest: bad compact_cursor level".into())
+                })?;
                 let _key = get_length_prefixed_slice(&mut input)
                     .ok_or_else(|| Error::Corruption("manifest: bad compact_cursor key".into()))?;
             }
@@ -375,9 +373,8 @@ fn decode_version_edit(mut input: &[u8]) -> Result<VersionEdit> {
                 let (smallest_seqno, largest_seqno) = if tag == TAG_NEW_FILE {
                     (0, 0)
                 } else {
-                    let s = get_varint64(&mut input).ok_or_else(|| {
-                        Error::Corruption("manifest: bad smallest_seqno".into())
-                    })?;
+                    let s = get_varint64(&mut input)
+                        .ok_or_else(|| Error::Corruption("manifest: bad smallest_seqno".into()))?;
                     let l = get_varint64(&mut input)
                         .ok_or_else(|| Error::Corruption("manifest: bad largest_seqno".into()))?;
                     (s, l)
@@ -526,10 +523,10 @@ fn decode_new_file4(
 fn decode_blob_addition(input: &mut &[u8]) -> Result<BlobAdditionEdit> {
     let number = get_varint64(input)
         .ok_or_else(|| Error::Corruption("blob_addition: bad file number".into()))?;
-    let total_blob_count = get_varint64(input)
-        .ok_or_else(|| Error::Corruption("blob_addition: bad count".into()))?;
-    let total_blob_bytes = get_varint64(input)
-        .ok_or_else(|| Error::Corruption("blob_addition: bad bytes".into()))?;
+    let total_blob_count =
+        get_varint64(input).ok_or_else(|| Error::Corruption("blob_addition: bad count".into()))?;
+    let total_blob_bytes =
+        get_varint64(input).ok_or_else(|| Error::Corruption("blob_addition: bad bytes".into()))?;
     let _checksum_method = get_length_prefixed_slice(input)
         .ok_or_else(|| Error::Corruption("blob_addition: bad checksum_method".into()))?;
     let _checksum_value = get_length_prefixed_slice(input)
@@ -545,10 +542,10 @@ fn decode_blob_addition(input: &mut &[u8]) -> Result<BlobAdditionEdit> {
 fn decode_blob_garbage(input: &mut &[u8]) -> Result<BlobGarbageEdit> {
     let number = get_varint64(input)
         .ok_or_else(|| Error::Corruption("blob_garbage: bad file number".into()))?;
-    let garbage_blob_count = get_varint64(input)
-        .ok_or_else(|| Error::Corruption("blob_garbage: bad count".into()))?;
-    let garbage_blob_bytes = get_varint64(input)
-        .ok_or_else(|| Error::Corruption("blob_garbage: bad bytes".into()))?;
+    let garbage_blob_count =
+        get_varint64(input).ok_or_else(|| Error::Corruption("blob_garbage: bad count".into()))?;
+    let garbage_blob_bytes =
+        get_varint64(input).ok_or_else(|| Error::Corruption("blob_garbage: bad bytes".into()))?;
     skip_blob_custom_fields(input, "blob_garbage")?;
     Ok(BlobGarbageEdit {
         number,

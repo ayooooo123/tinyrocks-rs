@@ -168,7 +168,9 @@ impl BlobIndex {
                 let size = get_varint64(&mut input)
                     .ok_or_else(|| Error::Corruption("BlobIndex: bad size".into()))?;
                 if input.len() != 1 {
-                    return Err(Error::Corruption("BlobIndex: bad trailing compression byte".into()));
+                    return Err(Error::Corruption(
+                        "BlobIndex: bad trailing compression byte".into(),
+                    ));
                 }
                 let compression = CompressionType::from_u8(input[0])?;
                 Ok(Self::Blob {
@@ -178,7 +180,9 @@ impl BlobIndex {
                     compression,
                 })
             }
-            other => Err(Error::Corruption(format!("BlobIndex: unknown type {other}"))),
+            other => Err(Error::Corruption(format!(
+                "BlobIndex: unknown type {other}"
+            ))),
         }
     }
 }

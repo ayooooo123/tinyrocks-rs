@@ -44,8 +44,7 @@ pub fn decompress(mut src: &[u8]) -> Result<Vec<u8>> {
                         if src.len() < 4 {
                             return Err(Error::Corruption("snappy: truncated literal len".into()));
                         }
-                        let v =
-                            u32::from_le_bytes([src[0], src[1], src[2], src[3]]) as usize + 1;
+                        let v = u32::from_le_bytes([src[0], src[1], src[2], src[3]]) as usize + 1;
                         src = &src[4..];
                         v
                     }
@@ -87,7 +86,9 @@ pub fn decompress(mut src: &[u8]) -> Result<Vec<u8>> {
             _ => unreachable!(),
         }
         if out.len() > uncompressed_len {
-            return Err(Error::Corruption("snappy: output exceeded header length".into()));
+            return Err(Error::Corruption(
+                "snappy: output exceeded header length".into(),
+            ));
         }
     }
 

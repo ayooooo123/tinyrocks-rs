@@ -14,9 +14,20 @@ const WRITE_BATCH_HEADER_SIZE: usize = 12;
 
 #[derive(Debug, Clone)]
 pub enum BatchOp {
-    Put { cf_id: u32, key: Vec<u8>, value: Vec<u8> },
-    Delete { cf_id: u32, key: Vec<u8> },
-    DeleteRange { cf_id: u32, start: Vec<u8>, end: Vec<u8> },
+    Put {
+        cf_id: u32,
+        key: Vec<u8>,
+        value: Vec<u8>,
+    },
+    Delete {
+        cf_id: u32,
+        key: Vec<u8>,
+    },
+    DeleteRange {
+        cf_id: u32,
+        start: Vec<u8>,
+        end: Vec<u8>,
+    },
 }
 
 /// Encodes a RocksDB `WriteBatch` payload starting at `first_seqno`.
@@ -82,7 +93,9 @@ pub fn replay_wal_file(
     let records = log::read_records(data, true)?;
     for rec in records {
         if rec.len() < WRITE_BATCH_HEADER_SIZE {
-            return Err(Error::Corruption("wal: WriteBatch shorter than 12 bytes".into()));
+            return Err(Error::Corruption(
+                "wal: WriteBatch shorter than 12 bytes".into(),
+            ));
         }
         let mut seqno = u64::from_le_bytes(rec[0..8].try_into().unwrap());
         let count = u32::from_le_bytes(rec[8..12].try_into().unwrap());

@@ -3,10 +3,10 @@
 use std::fs::{File, OpenOptions};
 use std::path::Path;
 
+use crate::Result;
 use crate::coding::{put_length_prefixed_slice, put_varint32, put_varint64};
 use crate::log::LogWriter;
 use crate::manifest::SstFileMeta;
-use crate::Result;
 
 const TAG_COMPARATOR: u32 = 1;
 const TAG_LOG_NUMBER: u32 = 2;
@@ -91,7 +91,11 @@ impl VersionEditBuilder {
             put_custom_varint(&mut dst, CUSTOM_FILE_CREATION_TIME, 0);
             put_custom_varint(&mut dst, CUSTOM_EPOCH_NUMBER, f.epoch_number.max(1));
             if f.oldest_blob_file_number != 0 {
-                put_custom_varint(&mut dst, CUSTOM_OLDEST_BLOB_FILE_NUMBER, f.oldest_blob_file_number);
+                put_custom_varint(
+                    &mut dst,
+                    CUSTOM_OLDEST_BLOB_FILE_NUMBER,
+                    f.oldest_blob_file_number,
+                );
             }
             put_varint32(&mut dst, CUSTOM_TERMINATE);
         }
@@ -148,7 +152,11 @@ pub fn sync_dir(dir: &Path) {
 }
 
 /// Appends one or more `VersionEditBuilder` records to the active `MANIFEST-*` and syncs it.
-pub fn append_edits(db_dir: &Path, manifest_name: &str, edits: &[VersionEditBuilder]) -> Result<()> {
+pub fn append_edits(
+    db_dir: &Path,
+    manifest_name: &str,
+    edits: &[VersionEditBuilder],
+) -> Result<()> {
     let path = db_dir.join(manifest_name);
     let file = OpenOptions::new().create(true).append(true).open(&path)?;
     let initial_len = file.metadata()?.len() as usize;

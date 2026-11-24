@@ -23,6 +23,9 @@ const DEFAULT_BLOB_FILE_SIZE: u64 = 256 * 1024 * 1024;
 const BLOB_RECORD_HEADER_SIZE: u64 = 32;
 const L0_COMPACTION_TRIGGER: usize = 8;
 
+type KeyVersion = (u64, ValueType, Vec<u8>);
+type VersionsByUserKey = BTreeMap<Vec<u8>, Vec<KeyVersion>>;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ScanDirection {
     Forward,
@@ -82,10 +85,12 @@ struct ColumnFamilyEngine {
 impl ColumnFamilyEngine {
     fn rebuild_range_dels(&mut self) {
         self.all_range_dels.clear();
-        self.all_range_dels.extend(self.memtable.range_dels.iter().cloned());
+        self.all_range_dels
+            .extend(self.memtable.range_dels.iter().cloned());
         for lvl in &self.levels {
             for sst in lvl {
-                self.all_range_dels.extend(sst.reader.range_dels.iter().cloned());
+                self.all_range_dels
+                    .extend(sst.reader.range_dels.iter().cloned());
             }
         }
     }
@@ -220,7 +225,9 @@ impl Db {
 
         // Repair a crash-truncated MANIFEST tail before appending any new VersionEdits.
         if !read_only && version.manifest_valid_len < version.manifest_file_len {
-            let mf = OpenOptions::new().write(true).open(dir.join(&manifest_name))?;
+            let mf = OpenOptions::new()
+                .write(true)
+                .open(dir.join(&manifest_name))?;
             mf.set_len(version.manifest_valid_len as u64)?;
             mf.sync_data()?;
             manifest_writer::sync_dir(dir);
@@ -517,7 +524,12 @@ impl Db {
                 .iter()
                 .map(|(k, v)| (k.clone(), v.clone()))
                 .collect();
-            (cf.id, entries, cf.memtable.range_dels.clone(), cf.next_epoch)
+            (
+                cf.id,
+                entries,
+                cf.memtable.range_dels.clone(),
+                cf.next_epoch,
+            )
         };
 
         // Write values >= MIN_BLOB_SIZE into rolling .blob files (capped at self.blob_file_size)
@@ -541,11 +553,8 @@ impl Db {
                         if blob_writer.is_none() {
                             let blob_file_num = self.next_file_number;
                             self.next_file_number += 1;
-                            blob_writer = Some(BlobFileWriter::create(
-                                &self.dir,
-                                blob_file_num,
-                                cf_id,
-                            )?);
+                            blob_writer =
+                                Some(BlobFileWriter::create(&self.dir, blob_file_num, cf_id)?);
                         }
                         let bw = blob_writer.as_mut().unwrap();
                         let bnum = bw.file_number();
@@ -732,8 +741,7 @@ impl Db {
             let is_bottommost = cf.levels.iter().skip(2).all(Vec::is_empty);
 
             let mut deleted_ssts: Vec<(u32, u64)> = Vec::new();
-            let mut by_user_key: BTreeMap<Vec<u8>, Vec<(u64, ValueType, Vec<u8>)>> =
-                BTreeMap::new();
+            let mut by_user_key: VersionsByUserKey = BTreeMap::new();
             let mut merged_rdels: Vec<RangeTombstone> = Vec::new();
 
             for sst in l0 {
@@ -769,7 +777,7 @@ impl Db {
             let mut oldest_blob = u64::MAX;
 
             for (ukey, mut versions) in by_user_key {
-                versions.sort_by(|a, b| b.0.cmp(&a.0));
+                versions.sort_by_key(|v| std::cmp::Reverse(v.0));
                 let tomb_seq = max_covering_seqno(&merged_rdels, &ukey);
                 let mut kept_newest = false;
 
@@ -779,7 +787,8 @@ impl Db {
                         kept_newest = true;
                         match vtype {
                             ValueType::Value => {
-                                final_entries.push((InternalKey::new(ukey.clone(), seq, vtype), raw));
+                                final_entries
+                                    .push((InternalKey::new(ukey.clone(), seq, vtype), raw));
                             }
                             ValueType::BlobIndex => {
                                 if let Ok(BlobIndex::Blob { file_number, .. }) =
@@ -787,21 +796,18 @@ impl Db {
                                 {
                                     oldest_blob = oldest_blob.min(file_number);
                                 }
-                                final_entries.push((InternalKey::new(ukey.clone(), seq, vtype), raw));
+                                final_entries
+                                    .push((InternalKey::new(ukey.clone(), seq, vtype), raw));
                             }
-                            ValueType::Deletion | ValueType::SingleDeletion => {
-                                if !is_bottommost {
-                                    final_entries
-                                        .push((InternalKey::new(ukey.clone(), seq, vtype), raw));
-                                }
+                            ValueType::Deletion | ValueType::SingleDeletion if !is_bottommost => {
+                                final_entries
+                                    .push((InternalKey::new(ukey.clone(), seq, vtype), raw));
                             }
                             _ => {}
                         }
                     } else if vtype == ValueType::BlobIndex
                         && let Ok(BlobIndex::Blob {
-                            file_number,
-                            size,
-                            ..
+                            file_number, size, ..
                         }) = BlobIndex::decode(&raw)
                     {
                         let rec_bytes = BLOB_RECORD_HEADER_SIZE + ukey.len() as u64 + size;
@@ -893,7 +899,8 @@ impl Db {
             cf.levels[1].retain(|s| !selected_l1_nums.contains(&s.meta.number));
             if let Some(opened) = new_opened {
                 cf.levels[1].push(opened);
-                cf.levels[1].sort_by(|a, b| a.meta.smallest.user_key.cmp(&b.meta.smallest.user_key));
+                cf.levels[1]
+                    .sort_by(|a, b| a.meta.smallest.user_key.cmp(&b.meta.smallest.user_key));
             }
             cf.next_epoch += 1;
 
@@ -915,8 +922,8 @@ impl Db {
                 .blob_files
                 .iter()
                 .filter(|(bnum, m)| {
-                    let all_garb = m.garbage_blob_count >= m.total_blob_count
-                        && m.total_blob_count > 0;
+                    let all_garb =
+                        m.garbage_blob_count >= m.total_blob_count && m.total_blob_count > 0;
                     let older_than_live = min_live_blob.is_none_or(|min_b| **bnum < min_b);
                     all_garb && older_than_live
                 })
@@ -948,9 +955,10 @@ impl Db {
             return Err(Error::Unsupported("database is read-only".into()));
         }
         if self.memory {
-            let cf = self.cfs.get_mut(cf_name).ok_or_else(|| {
-                Error::NotFound(format!("column family {cf_name:?} not found"))
-            })?;
+            let cf = self
+                .cfs
+                .get_mut(cf_name)
+                .ok_or_else(|| Error::NotFound(format!("column family {cf_name:?} not found")))?;
             let mut latest: BTreeMap<Vec<u8>, (u64, MemValue)> = BTreeMap::new();
             for (ik, mv) in std::mem::take(&mut cf.memtable.entries) {
                 match latest.get_mut(&ik.user_key) {
@@ -1000,8 +1008,7 @@ impl Db {
             let cf = self.cf(cf_name)?;
             let mut deleted_ssts: Vec<(u32, u64)> = Vec::new();
             // Keep ALL versions so we can accurately account for shadowed BlobIndex records.
-            let mut by_user_key: BTreeMap<Vec<u8>, Vec<(u64, ValueType, Vec<u8>)>> =
-                BTreeMap::new();
+            let mut by_user_key: VersionsByUserKey = BTreeMap::new();
 
             for (lvl_idx, lvl) in cf.levels.iter().enumerate() {
                 for sst in lvl {
@@ -1023,7 +1030,7 @@ impl Db {
             let mut dead_blobs: BTreeMap<u64, (u64, u64)> = BTreeMap::new();
 
             for (ukey, mut versions) in by_user_key {
-                versions.sort_by(|a, b| b.0.cmp(&a.0)); // newest first
+                versions.sort_by_key(|v| std::cmp::Reverse(v.0)); // newest first
                 let tomb_seq = max_covering_seqno(&cf.all_range_dels, &ukey);
                 let mut kept_newest = false;
 
@@ -1033,16 +1040,15 @@ impl Db {
                         kept_newest = true;
                         match vtype {
                             ValueType::Value | ValueType::BlobIndex => {
-                                live_entries.push((InternalKey::new(ukey.clone(), seq, vtype), raw));
+                                live_entries
+                                    .push((InternalKey::new(ukey.clone(), seq, vtype), raw));
                             }
                             ValueType::Deletion | ValueType::SingleDeletion => {}
                             _ => {}
                         }
                     } else if vtype == ValueType::BlobIndex
                         && let Ok(BlobIndex::Blob {
-                            file_number,
-                            size,
-                            ..
+                            file_number, size, ..
                         }) = BlobIndex::decode(&raw)
                     {
                         let rec_bytes = BLOB_RECORD_HEADER_SIZE + ukey.len() as u64 + size;
@@ -1120,11 +1126,8 @@ impl Db {
                         if new_blob_writer.is_none() {
                             let new_blob_num = self.next_file_number;
                             self.next_file_number += 1;
-                            new_blob_writer = Some(BlobFileWriter::create(
-                                &self.dir,
-                                new_blob_num,
-                                cf_id,
-                            )?);
+                            new_blob_writer =
+                                Some(BlobFileWriter::create(&self.dir, new_blob_num, cf_id)?);
                         }
                         let bw = new_blob_writer.as_mut().unwrap();
                         let bnum = bw.file_number();
@@ -1246,8 +1249,8 @@ impl Db {
                 .blob_files
                 .iter()
                 .filter(|(bnum, m)| {
-                    let all_garb = m.garbage_blob_count >= m.total_blob_count
-                        && m.total_blob_count > 0;
+                    let all_garb =
+                        m.garbage_blob_count >= m.total_blob_count && m.total_blob_count > 0;
                     let older_than_live =
                         oldest_blob_file_number == 0 || **bnum < oldest_blob_file_number;
                     all_garb && older_than_live

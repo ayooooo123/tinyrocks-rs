@@ -117,9 +117,15 @@ fn reads_format_v6_ssts_blobs_wal_deletes_and_range_deletes() {
     let tiny = Db::open_read_only(dir.path()).unwrap();
 
     // Point lookups: live, updated, deleted, range-deleted, resurrected, WAL, and 512 KiB blob.
-    assert_eq!(tiny.get_cf(CF, b"meta/0000").unwrap().as_deref(), Some(b"val-0000".as_slice()));
+    assert_eq!(
+        tiny.get_cf(CF, b"meta/0000").unwrap().as_deref(),
+        Some(b"val-0000".as_slice())
+    );
     assert_eq!(tiny.get_cf(CF, b"meta/0001").unwrap(), None);
-    assert_eq!(tiny.get_cf(CF, b"meta/0005").unwrap().as_deref(), Some(b"updated-5".as_slice()));
+    assert_eq!(
+        tiny.get_cf(CF, b"meta/0005").unwrap().as_deref(),
+        Some(b"updated-5".as_slice())
+    );
     assert_eq!(tiny.get_cf(CF, b"meta/0010").unwrap(), None);
     assert_eq!(tiny.get_cf(CF, b"meta/0120").unwrap(), None);
     assert_eq!(
@@ -135,11 +141,19 @@ fn reads_format_v6_ssts_blobs_wal_deletes_and_range_deletes() {
         tiny.get_cf(CF, b"wal/fresh").unwrap().as_deref(),
         Some(b"only-in-wal".as_slice())
     );
-    assert_eq!(tiny.get_cf(CF, b"blob/video0").unwrap().unwrap(), big_block_a);
-    assert_eq!(tiny.get_cf(CF, b"blob/video1").unwrap().unwrap(), big_block_b);
+    assert_eq!(
+        tiny.get_cf(CF, b"blob/video0").unwrap().unwrap(),
+        big_block_a
+    );
+    assert_eq!(
+        tiny.get_cf(CF, b"blob/video1").unwrap().unwrap(),
+        big_block_b
+    );
 
     // Full forward scan matches real RocksDB byte-for-byte.
-    let got_all = tiny.scan_cf(CF, None, None, ScanDirection::Forward).unwrap();
+    let got_all = tiny
+        .scan_cf(CF, None, None, ScanDirection::Forward)
+        .unwrap();
     assert_eq!(got_all, expected_all);
 
     // Bounded reverse scan matches real RocksDB byte-for-byte.
@@ -155,7 +169,10 @@ fn reads_format_v6_ssts_blobs_wal_deletes_and_range_deletes() {
 
     // Blob stats match RocksDB's reported live blob file size & garbage size.
     assert_eq!(tiny.live_blob_file_size(CF).unwrap(), rocks_blob_live);
-    assert_eq!(tiny.live_blob_file_garbage_size(CF).unwrap(), rocks_blob_garb);
+    assert_eq!(
+        tiny.live_blob_file_garbage_size(CF).unwrap(),
+        rocks_blob_garb
+    );
 }
 
 #[test]
@@ -200,7 +217,11 @@ fn tinyrocks_writes_and_real_rocksdb_reads_roundtrips_and_compacts_blobs() {
 
         let mut b1 = tinyrocks::WriteBatch::default();
         for i in 0u32..300 {
-            b1.put_cf(cf, format!("row/{i:04}").as_bytes(), format!("v-{i:04}").as_bytes());
+            b1.put_cf(
+                cf,
+                format!("row/{i:04}").as_bytes(),
+                format!("v-{i:04}").as_bytes(),
+            );
         }
         b1.put_cf(cf, b"vid/a", &blob_a);
         b1.put_cf(cf, b"vid/b", &blob_b);
@@ -226,10 +247,16 @@ fn tinyrocks_writes_and_real_rocksdb_reads_roundtrips_and_compacts_blobs() {
         let db = open_rocks(dir.path(), DBCompressionType::None);
         let cf = db.cf_handle(CF).unwrap();
 
-        assert_eq!(db.get_cf(cf, b"row/0000").unwrap().as_deref(), Some(b"v-0000".as_slice()));
+        assert_eq!(
+            db.get_cf(cf, b"row/0000").unwrap().as_deref(),
+            Some(b"v-0000".as_slice())
+        );
         assert_eq!(db.get_cf(cf, b"row/0007").unwrap(), None);
         assert_eq!(db.get_cf(cf, b"row/0110").unwrap(), None);
-        assert_eq!(db.get_cf(cf, b"row/0125").unwrap().as_deref(), Some(b"reborn-125".as_slice()));
+        assert_eq!(
+            db.get_cf(cf, b"row/0125").unwrap().as_deref(),
+            Some(b"reborn-125".as_slice())
+        );
         assert_eq!(
             db.get_cf(cf, b"wal/from-tiny").unwrap().as_deref(),
             Some(b"survived-into-rocksdb".as_slice())
@@ -280,7 +307,10 @@ fn tinyrocks_writes_and_real_rocksdb_reads_roundtrips_and_compacts_blobs() {
             db.get_cf(cf, b"from-rocks/hello").unwrap().as_deref(),
             Some(b"world".as_slice())
         );
-        assert_eq!(db.get_cf(cf, b"row/0125").unwrap().as_deref(), Some(b"reborn-125".as_slice()));
+        assert_eq!(
+            db.get_cf(cf, b"row/0125").unwrap().as_deref(),
+            Some(b"reborn-125".as_slice())
+        );
         assert_eq!(db.get_cf(cf, b"row/0110").unwrap(), None);
     }
 }
@@ -336,7 +366,11 @@ fn differential_fuzz_against_real_rocksdb() {
             // Range delete
             let a = (next_u64() % key_space as u64) as u32;
             let b_raw = (next_u64() % key_space as u64) as u32;
-            let (lo, hi) = if a <= b_raw { (a, b_raw + 1) } else { (b_raw, a + 1) };
+            let (lo, hi) = if a <= b_raw {
+                (a, b_raw + 1)
+            } else {
+                (b_raw, a + 1)
+            };
             let ks = format!("k/{lo:04}");
             let ke = format!("k/{hi:04}");
             let mut rb = WriteBatch::default();
@@ -420,7 +454,7 @@ fn bloom_filter_interop_bidirectional() {
             1 => format!("k{i:04}").into_bytes(),                 // len 5
             2 => format!("medium-key-{i:06}").into_bytes(),       // len 17
             3 => format!("midsize-key-{i:06}-{}", "x".repeat(140)).into_bytes(), // len 159
-            _ => format!("long-key-{i:06}-{}", "y".repeat(320)).into_bytes(),    // len 336
+            _ => format!("long-key-{i:06}-{}", "y".repeat(320)).into_bytes(), // len 336
         })
         .collect();
     {
@@ -441,7 +475,10 @@ fn bloom_filter_interop_bidirectional() {
         .find(|p| p.extension().is_some_and(|x| x == "sst"))
         .expect("RocksDB should have flushed an SST");
     let reader = tinyrocks::sst::SstReader::open(&sst_path).unwrap();
-    assert!(reader.has_filter(), "RocksDB SST should carry BuiltinBloomFilter");
+    assert!(
+        reader.has_filter(),
+        "RocksDB SST should carry BuiltinBloomFilter"
+    );
 
     // 0 false negatives across every length tier (2B, 5B, 17B, 159B, 336B).
     for k in &keys {
@@ -567,9 +604,18 @@ fn crash_recovery_truncated_wal_manifest_and_orphan_cleanup() {
             db.get_cf(CF, b"committed/wal").unwrap().as_deref(),
             Some(b"in-wal".as_slice())
         );
-        assert!(!orphan_sst.exists(), "orphan SST should be removed on open_rw");
-        assert!(!orphan_blob.exists(), "orphan blob should be removed on open_rw");
-        assert!(!orphan_tmp.exists(), "CURRENT.tmp should be removed on open_rw");
+        assert!(
+            !orphan_sst.exists(),
+            "orphan SST should be removed on open_rw"
+        );
+        assert!(
+            !orphan_blob.exists(),
+            "orphan blob should be removed on open_rw"
+        );
+        assert!(
+            !orphan_tmp.exists(),
+            "CURRENT.tmp should be removed on open_rw"
+        );
 
         // Write & flush one more batch to verify repaired MANIFEST accepts subsequent edits.
         let cf = db.cf_id(CF).unwrap();
@@ -612,11 +658,7 @@ fn auto_l0_compaction_triggers_and_stays_compatible() {
                 let k = format!("auto/{batch_idx:02}/{j:02}");
                 b.put_cf(cf, k.as_bytes(), format!("v-{batch_idx}-{j}").as_bytes());
             }
-            b.put_cf(
-                cf,
-                format!("blob/{batch_idx:02}").as_bytes(),
-                &blob_payload,
-            );
+            b.put_cf(cf, format!("blob/{batch_idx:02}").as_bytes(), &blob_payload);
             if batch_idx == 5 {
                 b.delete_range_cf(cf, b"auto/02/00", b"auto/03/00");
             }
@@ -672,7 +714,8 @@ fn bench_peartube_workload_tinyrocks_vs_rocksdb() {
             db.flush_cf(cf).unwrap();
         }
         for i in 0..n_blobs {
-            db.put_cf(cf, format!("blk/{i:06}").as_bytes(), &payload).unwrap();
+            db.put_cf(cf, format!("blk/{i:06}").as_bytes(), &payload)
+                .unwrap();
         }
         db.flush_cf(cf).unwrap();
     }
@@ -683,14 +726,24 @@ fn bench_peartube_workload_tinyrocks_vs_rocksdb() {
         let db = open_rocks(dir_r.path(), DBCompressionType::None);
         let cf = db.cf_handle(CF).unwrap();
         for i in 0..n_meta {
-            let v = db.get_cf(cf, format!("tree/{i:06}").as_bytes()).unwrap().unwrap();
+            let v = db
+                .get_cf(cf, format!("tree/{i:06}").as_bytes())
+                .unwrap()
+                .unwrap();
             assert_eq!(v.len(), 40);
         }
         for i in 0..n_misses {
-            assert!(db.get_cf(cf, format!("miss/{i:06}").as_bytes()).unwrap().is_none());
+            assert!(
+                db.get_cf(cf, format!("miss/{i:06}").as_bytes())
+                    .unwrap()
+                    .is_none()
+            );
         }
         for i in 0..n_blobs {
-            let v = db.get_cf(cf, format!("blk/{i:06}").as_bytes()).unwrap().unwrap();
+            let v = db
+                .get_cf(cf, format!("blk/{i:06}").as_bytes())
+                .unwrap()
+                .unwrap();
             assert_eq!(v.len(), payload.len());
         }
     }
@@ -723,14 +776,24 @@ fn bench_peartube_workload_tinyrocks_vs_rocksdb() {
     {
         let db = Db::open_read_only(dir_t.path()).unwrap();
         for i in 0..n_meta {
-            let v = db.get_cf(CF, format!("tree/{i:06}").as_bytes()).unwrap().unwrap();
+            let v = db
+                .get_cf(CF, format!("tree/{i:06}").as_bytes())
+                .unwrap()
+                .unwrap();
             assert_eq!(v.len(), 40);
         }
         for i in 0..n_misses {
-            assert!(db.get_cf(CF, format!("miss/{i:06}").as_bytes()).unwrap().is_none());
+            assert!(
+                db.get_cf(CF, format!("miss/{i:06}").as_bytes())
+                    .unwrap()
+                    .is_none()
+            );
         }
         for i in 0..n_blobs {
-            let v = db.get_cf(CF, format!("blk/{i:06}").as_bytes()).unwrap().unwrap();
+            let v = db
+                .get_cf(CF, format!("blk/{i:06}").as_bytes())
+                .unwrap()
+                .unwrap();
             assert_eq!(v.len(), payload.len());
         }
     }

@@ -104,7 +104,8 @@ pub fn xxph3_64bits(input: &[u8]) -> u64 {
         let hi = read_le32(&input[len - 4..]) as u64;
         let input_64 = lo | (hi << 32);
         let keyed = input_64 ^ read_le64(&K_SECRET[..8]);
-        let mix64 = (len as u64).wrapping_add((keyed ^ (keyed >> 51)).wrapping_mul(PRIME32_1 as u64));
+        let mix64 =
+            (len as u64).wrapping_add((keyed ^ (keyed >> 51)).wrapping_mul(PRIME32_1 as u64));
         return avalanche((mix64 ^ (mix64 >> 47)).wrapping_mul(PRIME64_2));
     }
     if len <= 16 {
@@ -267,7 +268,7 @@ impl BloomBuilder {
         if num_entries == 0 {
             return vec![FAST_LOCAL_MARKER, FAST_LOCAL_SUB_IMPL, 0, 0, 0];
         }
-        let raw_len = (num_entries.saturating_mul(MILLIBITS_PER_KEY) + 7999) / 8000;
+        let raw_len = num_entries.saturating_mul(MILLIBITS_PER_KEY).div_ceil(8000);
         let bit_bytes = ((raw_len + 63) & !63).clamp(64, 0xffff_ffc0);
         let mut out = vec![0u8; bit_bytes + K_METADATA_LEN];
         let num_lines = (bit_bytes >> 6) as u32;
