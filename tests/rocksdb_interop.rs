@@ -690,6 +690,52 @@ fn auto_l0_compaction_triggers_and_stays_compatible() {
 }
 
 #[test]
+fn wal_files_are_reclaimed_when_other_cf_is_unused() {
+    let dir = tempfile::tempdir().unwrap();
+    let dir_bytes = |p: &std::path::Path| -> u64 {
+        std::fs::read_dir(p)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter_map(|e| e.metadata().ok())
+            .map(|m| m.len())
+            .sum()
+    };
+
+    let mut db = Db::open_rw(dir.path(), &[CF]).unwrap();
+    let cf = db.cf_id(CF).unwrap();
+    let payload = vec![0x99u8; 512 * 1024];
+    for i in 0u32..32 {
+        let mut b = tinyrocks::WriteBatch::default();
+        b.put_cf(cf, format!("vid/{i:04}").as_bytes(), &payload);
+        db.write_batch(&b, false).unwrap();
+    }
+    let before = dir_bytes(dir.path());
+    assert!(
+        before >= 16 * 1024 * 1024,
+        "expected >= 16 MiB, got {before}"
+    );
+
+    // Delete all video blocks and compact: BOTH .blob files AND obsolete .log WALs must be
+    // reclaimed immediately even though the `default` CF was never written to.
+    let mut del = tinyrocks::WriteBatch::default();
+    del.delete_range_cf(cf, b"vid/0000", b"vid/9999");
+    db.write_batch(&del, false).unwrap();
+    db.compact_cf(CF, true).unwrap();
+
+    let after = dir_bytes(dir.path());
+    assert!(
+        after < 256 * 1024,
+        "expected < 256 KiB after clear + compact, got {after} (WAL leak!)"
+    );
+
+    // Real RocksDB 10.4.2 opens the cleaned directory cleanly and sees 0 keys.
+    drop(db);
+    let rdb = open_rocks(dir.path(), DBCompressionType::None);
+    let rcf = rdb.cf_handle(CF).unwrap();
+    assert_eq!(rdb.iterator_cf(rcf, IteratorMode::Start).count(), 0);
+}
+
+#[test]
 fn bench_peartube_workload_tinyrocks_vs_rocksdb() {
     use std::time::Instant;
 

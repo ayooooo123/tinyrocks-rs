@@ -629,7 +629,29 @@ impl Db {
             edit.blob_additions
                 .push((bs.file_number, bs.total_blob_count, bs.total_blob_bytes));
         }
-        manifest_writer::append_edits(&self.dir, &self.manifest_name, &[edit])?;
+
+        // Advance `log_number` for any other column family whose memtable is currently empty
+        // (such as an unused `default` CF), matching RocksDB so obsolete WAL files are unlinked.
+        let mut edits = vec![edit];
+        let empty_other_cfs: Vec<(String, u32)> = self
+            .cfs
+            .iter()
+            .filter(|(name, c)| {
+                name.as_str() != cf_name
+                    && c.memtable.entries.is_empty()
+                    && c.memtable.range_dels.is_empty()
+                    && c.log_number < new_wal_num
+            })
+            .map(|(name, c)| (name.clone(), c.id))
+            .collect();
+        for (_, other_id) in &empty_other_cfs {
+            edits.push(VersionEditBuilder {
+                column_family: *other_id,
+                log_number: Some(new_wal_num),
+                ..Default::default()
+            });
+        }
+        manifest_writer::append_edits(&self.dir, &self.manifest_name, &edits)?;
 
         // Update in-memory state.
         let reader = SstReader::open(&self.dir.join(format!("{sst_num:06}.sst")))?;
@@ -662,11 +684,27 @@ impl Db {
             );
         }
         cf.rebuild_range_dels();
+        for (other_name, _) in empty_other_cfs {
+            if let Some(other) = self.cfs.get_mut(&other_name) {
+                other.log_number = new_wal_num;
+            }
+        }
 
-        // Remove obsolete WAL if no CF still depends on it.
+        // Remove all obsolete WAL files no CF still depends on.
         let min_cf_log = self.cfs.values().map(|c| c.log_number).min().unwrap_or(0);
-        if old_wal > 0 && old_wal < min_cf_log {
-            let _ = std::fs::remove_file(self.dir.join(format!("{old_wal:06}.log")));
+        let _ = old_wal;
+        if let Ok(entries) = std::fs::read_dir(&self.dir) {
+            for entry in entries.flatten() {
+                let name = entry.file_name();
+                if let Some(s) = name.to_str()
+                    && let Some(stem) = s.strip_suffix(".log")
+                    && let Ok(num) = stem.parse::<u64>()
+                    && num < min_cf_log
+                    && num != new_wal_num
+                {
+                    let _ = std::fs::remove_file(entry.path());
+                }
+            }
         }
 
         // Incremental L0 -> L1 merge when L0 fanout reaches the trigger (without relocating blobs).
