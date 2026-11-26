@@ -378,6 +378,21 @@ impl SstReader {
         Ok(out)
     }
 
+    /// Streams all entries sequentially without populating the point-lookup `BlockCache`
+    /// or allocating an intermediate `Vec<SstEntry>`, keeping compactions lean.
+    pub fn for_each_entry<F>(&self, mut visit: F) -> Result<()>
+    where
+        F: FnMut(Vec<u8>, Vec<u8>) -> Result<()>,
+    {
+        for entry in &self.index_entries {
+            let block = read_block(&self.file, &self.footer, entry.handle)?;
+            for (k, v) in decode_standard_block(&block)? {
+                visit(k, v)?;
+            }
+        }
+        Ok(())
+    }
+
     fn separator_user_key<'a>(&self, sep: &'a [u8]) -> &'a [u8] {
         if self.index_key_is_user_key || sep.len() < 8 {
             sep

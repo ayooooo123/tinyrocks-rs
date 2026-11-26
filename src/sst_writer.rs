@@ -99,7 +99,7 @@ pub struct BuiltSst {
 }
 
 /// Writes a format-v6 `BlockBasedTable` SST from sorted `(InternalKey, value)` entries
-/// and optional `RangeTombstone`s.
+/// and optional `RangeTombstone`s, syncing the file to disk before returning.
 pub fn write_sst(
     db_dir: &Path,
     file_number: u64,
@@ -109,6 +109,31 @@ pub fn write_sst(
     range_dels: &[RangeTombstone],
     oldest_blob_file_number: u64,
 ) -> Result<BuiltSst> {
+    write_sst_with_sync(
+        db_dir,
+        file_number,
+        cf_id,
+        cf_name,
+        entries,
+        range_dels,
+        oldest_blob_file_number,
+        true,
+    )
+}
+
+/// Same as [`write_sst`], with caller-controlled `sync_data` (avoids per-flush
+/// `F_FULLFSYNC` stalls on macOS when durability is managed at close/suspend).
+#[allow(clippy::too_many_arguments)]
+pub fn write_sst_with_sync(
+    db_dir: &Path,
+    file_number: u64,
+    cf_id: u32,
+    cf_name: &str,
+    entries: &[(InternalKey, Vec<u8>)],
+    range_dels: &[RangeTombstone],
+    oldest_blob_file_number: u64,
+    sync: bool,
+) -> Result<BuiltSst> {
     assert!(
         !entries.is_empty() || !range_dels.is_empty(),
         "cannot write an empty SST"
@@ -116,7 +141,7 @@ pub fn write_sst(
 
     let path = db_dir.join(format!("{file_number:06}.sst"));
     let file = File::create(path)?;
-    let mut writer = BufWriter::new(file);
+    let mut writer = BufWriter::with_capacity(256 * 1024, file);
     let mut offset = 0u64;
 
     // Non-zero per-file context checksum seed (`ChecksumModifierForContext(bcc, 0) != 0`).
@@ -325,7 +350,9 @@ pub fn write_sst(
 
     writer.flush()?;
     let file = writer.into_inner().map_err(|e| e.into_error())?;
-    file.sync_data()?;
+    if sync {
+        file.sync_data()?;
+    }
 
     // Verify boundaries parsed cleanly.
     let smallest = smallest.unwrap();

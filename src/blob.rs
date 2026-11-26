@@ -49,7 +49,7 @@ impl BlobFileWriter {
     pub fn create(db_dir: &Path, file_number: u64, cf_id: u32) -> Result<Self> {
         let path = db_dir.join(format!("{file_number:06}.blob"));
         let file = File::create(path)?;
-        let mut writer = BufWriter::new(file);
+        let mut writer = BufWriter::with_capacity(512 * 1024, file);
         let mut hdr = Vec::with_capacity(BLOB_HEADER_SIZE);
         hdr.extend_from_slice(&BLOB_MAGIC.to_le_bytes());
         hdr.extend_from_slice(&BLOB_VERSION_1.to_le_bytes());
@@ -105,7 +105,11 @@ impl BlobFileWriter {
         self.file_number
     }
 
-    pub fn finish(mut self) -> Result<BlobFileStats> {
+    pub fn finish(self) -> Result<BlobFileStats> {
+        self.finish_with_sync(true)
+    }
+
+    pub fn finish_with_sync(mut self, sync: bool) -> Result<BlobFileStats> {
         let mut footer = Vec::with_capacity(BLOB_FOOTER_SIZE);
         footer.extend_from_slice(&BLOB_MAGIC.to_le_bytes());
         footer.extend_from_slice(&self.blob_count.to_le_bytes());
@@ -117,7 +121,9 @@ impl BlobFileWriter {
         self.writer.write_all(&footer)?;
         self.writer.flush()?;
         let file = self.writer.into_inner().map_err(|e| e.into_error())?;
-        file.sync_data()?;
+        if sync {
+            file.sync_data()?;
+        }
         Ok(BlobFileStats {
             file_number: self.file_number,
             total_blob_count: self.blob_count,

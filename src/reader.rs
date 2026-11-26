@@ -2,6 +2,8 @@
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs::{File, OpenOptions};
+use std::io::BufWriter;
+use std::ops::Bound;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
@@ -20,8 +22,10 @@ use crate::{Error, Result};
 const MIN_BLOB_SIZE: usize = 4096;
 const DEFAULT_WRITE_BUFFER_BYTES: usize = 12 * 1024 * 1024;
 const DEFAULT_BLOB_FILE_SIZE: u64 = 256 * 1024 * 1024;
+const DEFAULT_TARGET_L1_SST_BYTES: usize = 8 * 1024 * 1024;
 const BLOB_RECORD_HEADER_SIZE: u64 = 32;
 const L0_COMPACTION_TRIGGER: usize = 8;
+const WAL_BUF_BYTES: usize = 256 * 1024;
 
 type KeyVersion = (u64, ValueType, Vec<u8>);
 type VersionsByUserKey = BTreeMap<Vec<u8>, Vec<KeyVersion>>;
@@ -122,12 +126,15 @@ pub struct Db {
     next_file_number: u64,
     last_sequence: u64,
     active_wal_number: u64,
-    wal_writer: Option<LogWriter<File>>,
+    live_wals: Vec<u64>,
+    wal_writer: Option<LogWriter<BufWriter<File>>>,
     cfs: BTreeMap<String, ColumnFamilyEngine>,
     cf_id_to_name: HashMap<u32, String>,
     blob_readers: Mutex<HashMap<u64, Arc<BlobFileReader>>>,
     write_buffer_bytes: usize,
     blob_file_size: u64,
+    target_sst_bytes: usize,
+    sync_on_flush: bool,
 }
 
 impl Db {
@@ -176,12 +183,15 @@ impl Db {
             next_file_number: 1,
             last_sequence: 0,
             active_wal_number: 0,
+            live_wals: Vec::new(),
             wal_writer: None,
             cfs,
             cf_id_to_name,
             blob_readers: Mutex::new(HashMap::new()),
             write_buffer_bytes: DEFAULT_WRITE_BUFFER_BYTES,
             blob_file_size: DEFAULT_BLOB_FILE_SIZE,
+            target_sst_bytes: DEFAULT_TARGET_L1_SST_BYTES,
+            sync_on_flush: true,
         })
     }
 
@@ -191,6 +201,17 @@ impl Db {
 
     pub fn set_write_buffer_size(&mut self, bytes: usize) {
         self.write_buffer_bytes = bytes.max(64 * 1024);
+    }
+
+    /// Sets the target raw payload size per non-overlapping L1 SST file.
+    pub fn set_target_sst_size(&mut self, bytes: usize) {
+        self.target_sst_bytes = bytes.max(4 * 1024);
+    }
+
+    /// Controls whether routine memtable flushes and compactions invoke `sync_data()`
+    /// (which issues `F_FULLFSYNC` on macOS). Explicit `flush_wal(true)` always syncs.
+    pub fn set_sync_on_flush(&mut self, sync: bool) {
+        self.sync_on_flush = sync;
     }
 
     fn open_internal(dir: &Path, requested_cfs: &[&str], read_only: bool) -> Result<Self> {
@@ -336,8 +357,8 @@ impl Db {
 
         // Open a fresh WAL file for new writes when read-write, and clean up orphaned files
         // left behind by an earlier crash before MANIFEST commit.
-        let (active_wal_number, wal_writer) = if read_only {
-            (0, None)
+        let (active_wal_number, live_wals, wal_writer) = if read_only {
+            (0, Vec::new(), None)
         } else {
             let wal_num = next_file_number;
             next_file_number += 1;
@@ -347,7 +368,21 @@ impl Db {
                 .truncate(true)
                 .open(dir.join(format!("{wal_num:06}.log")))?;
             cleanup_orphan_files(dir, &cfs, wal_num);
-            (wal_num, Some(LogWriter::new(wal_file, 0)))
+            let min_cf_log = cfs.values().map(|c| c.log_number).min().unwrap_or(0);
+            let mut live: Vec<u64> = wal_files
+                .iter()
+                .map(|(num, _)| *num)
+                .filter(|&num| num >= min_cf_log)
+                .collect();
+            live.push(wal_num);
+            (
+                wal_num,
+                live,
+                Some(LogWriter::new(
+                    BufWriter::with_capacity(WAL_BUF_BYTES, wal_file),
+                    0,
+                )),
+            )
         };
 
         Ok(Self {
@@ -359,12 +394,15 @@ impl Db {
             next_file_number,
             last_sequence,
             active_wal_number,
+            live_wals,
             wal_writer,
             cfs,
             cf_id_to_name,
             blob_readers: Mutex::new(HashMap::new()),
             write_buffer_bytes: DEFAULT_WRITE_BUFFER_BYTES,
             blob_file_size: DEFAULT_BLOB_FILE_SIZE,
+            target_sst_bytes: DEFAULT_TARGET_L1_SST_BYTES,
+            sync_on_flush: true,
         })
     }
 
@@ -375,6 +413,11 @@ impl Db {
     /// Number of L0 SST files currently in `cf_name` (useful for diagnostics/tests).
     pub fn l0_file_count(&self, cf_name: &str) -> Result<usize> {
         Ok(self.cf(cf_name)?.levels.first().map_or(0, Vec::len))
+    }
+
+    /// Number of L1 SST files currently in `cf_name` (useful for diagnostics/tests).
+    pub fn l1_file_count(&self, cf_name: &str) -> Result<usize> {
+        Ok(self.cf(cf_name)?.levels.get(1).map_or(0, Vec::len))
     }
 
     pub fn live_blob_file_size(&self, cf_name: &str) -> Result<u64> {
@@ -494,12 +537,18 @@ impl Db {
         if let Some(w) = self.wal_writer.take() {
             let mut w = w;
             w.flush()?;
-            let file = w.into_inner();
+            let file = w
+                .into_inner()
+                .into_inner()
+                .map_err(|e| Error::Io(e.into_error()))?;
             if sync {
                 file.sync_data()?;
             }
             let len = file.metadata()?.len() as usize;
-            self.wal_writer = Some(LogWriter::new(file, len));
+            self.wal_writer = Some(LogWriter::new(
+                BufWriter::with_capacity(WAL_BUF_BYTES, file),
+                len,
+            ));
         }
         Ok(())
     }
@@ -548,7 +597,12 @@ impl Db {
                         if let Some(bw) = blob_writer.as_ref()
                             && bw.current_bytes() >= self.blob_file_size
                         {
-                            finished_blobs.push(blob_writer.take().unwrap().finish()?);
+                            finished_blobs.push(
+                                blob_writer
+                                    .take()
+                                    .unwrap()
+                                    .finish_with_sync(self.sync_on_flush)?,
+                            );
                         }
                         if blob_writer.is_none() {
                             let blob_file_num = self.next_file_number;
@@ -573,7 +627,7 @@ impl Db {
         }
 
         if let Some(bw) = blob_writer {
-            finished_blobs.push(bw.finish()?);
+            finished_blobs.push(bw.finish_with_sync(self.sync_on_flush)?);
         }
         let oldest_blob = finished_blobs
             .iter()
@@ -583,7 +637,7 @@ impl Db {
 
         let sst_num = self.next_file_number;
         self.next_file_number += 1;
-        let built = sst_writer::write_sst(
+        let built = sst_writer::write_sst_with_sync(
             &self.dir,
             sst_num,
             cf_id,
@@ -591,10 +645,10 @@ impl Db {
             &sst_entries,
             &mem_rdels,
             oldest_blob,
+            self.sync_on_flush,
         )?;
 
         // Rotate WAL so RocksDB knows all flushed ops are <= new_wal_num.
-        let old_wal = self.active_wal_number;
         let new_wal_num = self.next_file_number;
         self.next_file_number += 1;
         let new_wal_file = OpenOptions::new()
@@ -602,8 +656,12 @@ impl Db {
             .write(true)
             .truncate(true)
             .open(self.dir.join(format!("{new_wal_num:06}.log")))?;
-        self.wal_writer = Some(LogWriter::new(new_wal_file, 0));
+        self.wal_writer = Some(LogWriter::new(
+            BufWriter::with_capacity(WAL_BUF_BYTES, new_wal_file),
+            0,
+        ));
         self.active_wal_number = new_wal_num;
+        self.live_wals.push(new_wal_num);
 
         let sst_meta = SstFileMeta {
             number: built.file_number,
@@ -651,7 +709,12 @@ impl Db {
                 ..Default::default()
             });
         }
-        manifest_writer::append_edits(&self.dir, &self.manifest_name, &edits)?;
+        manifest_writer::append_edits_with_sync(
+            &self.dir,
+            &self.manifest_name,
+            &edits,
+            self.sync_on_flush,
+        )?;
 
         // Update in-memory state.
         let reader = SstReader::open(&self.dir.join(format!("{sst_num:06}.sst")))?;
@@ -690,22 +753,17 @@ impl Db {
             }
         }
 
-        // Remove all obsolete WAL files no CF still depends on.
+        // Remove all obsolete WAL files no CF still depends on without scanning the directory.
         let min_cf_log = self.cfs.values().map(|c| c.log_number).min().unwrap_or(0);
-        let _ = old_wal;
-        if let Ok(entries) = std::fs::read_dir(&self.dir) {
-            for entry in entries.flatten() {
-                let name = entry.file_name();
-                if let Some(s) = name.to_str()
-                    && let Some(stem) = s.strip_suffix(".log")
-                    && let Ok(num) = stem.parse::<u64>()
-                    && num < min_cf_log
-                    && num != new_wal_num
-                {
-                    let _ = std::fs::remove_file(entry.path());
-                }
+        let dir = &self.dir;
+        self.live_wals.retain(|&num| {
+            if num < min_cf_log && num != new_wal_num {
+                let _ = std::fs::remove_file(dir.join(format!("{num:06}.log")));
+                false
+            } else {
+                true
             }
-        }
+        });
 
         // Incremental L0 -> L1 merge when L0 fanout reaches the trigger (without relocating blobs).
         if self.cfs.get(cf_name).is_some_and(|c| {
@@ -719,19 +777,18 @@ impl Db {
         Ok(())
     }
 
-    /// Merges all L0 SSTs with overlapping L1 SSTs into a clean L1 SST without copying live
-    /// `.blob` files, keeping point-lookup fanout bounded on large databases.
+    /// Merges all L0 SSTs with overlapping L1 SSTs into size-bounded, non-overlapping
+    /// L1 SSTs without copying live `.blob` files or rewriting unrelated key ranges.
     fn compact_l0_to_l1(&mut self, cf_name: &str) -> Result<()> {
         let (
             cf_id,
             epoch,
-            is_bottommost,
             selected_l1_nums,
+            unselected_l1_starts,
             deleted_ssts,
             final_entries,
             final_rdels,
             dead_blobs,
-            oldest_blob_in_new_sst,
         ) = {
             let cf = self.cf(cf_name)?;
             let l0 = match cf.levels.first() {
@@ -739,60 +796,56 @@ impl Db {
                 _ => return Ok(()),
             };
 
-            // Determine the combined key span of all L0 SSTs + L0 range tombstones.
-            let mut min_key: Option<&[u8]> = None;
-            let mut max_key: Option<&[u8]> = None;
-            for sst in l0 {
-                let lo = sst.meta.smallest.user_key.as_slice();
-                let hi = sst.meta.largest.user_key.as_slice();
-                if min_key.is_none_or(|cur| lo < cur) {
-                    min_key = Some(lo);
-                }
-                if max_key.is_none_or(|cur| hi > cur) {
-                    max_key = Some(hi);
-                }
-                for rd in &sst.reader.range_dels {
-                    if min_key.is_none_or(|cur| rd.start.as_slice() < cur) {
-                        min_key = Some(rd.start.as_slice());
-                    }
-                    if max_key.is_none_or(|cur| rd.end.as_slice() > cur) {
-                        max_key = Some(rd.end.as_slice());
-                    }
-                }
-            }
-            let (Some(span_lo), Some(span_hi)) = (min_key, max_key) else {
-                return Ok(());
-            };
-
-            // Select L1 SSTs overlapping [span_lo, span_hi].
-            let mut selected_l1_nums: HashSet<u64> = HashSet::new();
-            if let Some(l1) = cf.levels.get(1) {
-                for sst in l1 {
-                    let s_lo = sst.meta.smallest.user_key.as_slice();
-                    let s_hi = sst.meta.largest.user_key.as_slice();
-                    if s_hi >= span_lo && s_lo <= span_hi {
-                        selected_l1_nums.insert(sst.meta.number);
-                    }
-                }
-            }
-
             let is_bottommost = cf.levels.iter().skip(2).all(Vec::is_empty);
 
             let mut deleted_ssts: Vec<(u32, u64)> = Vec::new();
             let mut by_user_key: VersionsByUserKey = BTreeMap::new();
             let mut merged_rdels: Vec<RangeTombstone> = Vec::new();
+            let mut l0_rdels: Vec<RangeTombstone> = Vec::new();
 
+            // Read the small L0 SSTs first so L1 selection checks actual L0 keys
+            // and range tombstones rather than coarse `[smallest..largest]` bounds.
+            // A single L0 SST that touches both metadata near key 0 and a video
+            // core near the end of the keyspace would otherwise bridge across and
+            // rewrite every untouched L1 shard in between.
             for sst in l0 {
                 deleted_ssts.push((0, sst.meta.number));
+                l0_rdels.extend(sst.reader.range_dels.iter().cloned());
                 merged_rdels.extend(sst.reader.range_dels.iter().cloned());
-                for entry in sst.reader.scan_range(None, None)? {
-                    let parsed = ParsedInternalKey::parse(&entry.internal_key)?;
+                sst.reader.for_each_entry(|ikey, val| {
+                    let parsed = ParsedInternalKey::parse(&ikey)?;
                     by_user_key
                         .entry(parsed.user_key.to_vec())
                         .or_default()
-                        .push((parsed.seqno, parsed.value_type, entry.value));
+                        .push((parsed.seqno, parsed.value_type, val));
+                    Ok(())
+                })?;
+            }
+
+            // Select only L1 SSTs that contain at least one actual L0 key or
+            // overlap an L0 range tombstone `[start, end)`.
+            let mut selected_l1_nums: HashSet<u64> = HashSet::new();
+            let mut unselected_l1_starts: Vec<Vec<u8>> = Vec::new();
+            if let Some(l1) = cf.levels.get(1) {
+                for sst in l1 {
+                    let s_lo = sst.meta.smallest.user_key.as_slice();
+                    let s_hi = sst.meta.largest.user_key.as_slice();
+                    let key_hit = by_user_key
+                        .range::<[u8], _>((Bound::Included(s_lo), Bound::Included(s_hi)))
+                        .next()
+                        .is_some();
+                    let rdel_hit = l0_rdels
+                        .iter()
+                        .any(|rd| s_hi >= rd.start.as_slice() && s_lo < rd.end.as_slice());
+                    if key_hit || rdel_hit {
+                        selected_l1_nums.insert(sst.meta.number);
+                    } else {
+                        unselected_l1_starts.push(s_lo.to_vec());
+                    }
                 }
             }
+            unselected_l1_starts.sort();
+
             if let Some(l1) = cf.levels.get(1) {
                 for sst in l1 {
                     if !selected_l1_nums.contains(&sst.meta.number) {
@@ -800,19 +853,19 @@ impl Db {
                     }
                     deleted_ssts.push((1, sst.meta.number));
                     merged_rdels.extend(sst.reader.range_dels.iter().cloned());
-                    for entry in sst.reader.scan_range(None, None)? {
-                        let parsed = ParsedInternalKey::parse(&entry.internal_key)?;
+                    sst.reader.for_each_entry(|ikey, val| {
+                        let parsed = ParsedInternalKey::parse(&ikey)?;
                         by_user_key
                             .entry(parsed.user_key.to_vec())
                             .or_default()
-                            .push((parsed.seqno, parsed.value_type, entry.value));
-                    }
+                            .push((parsed.seqno, parsed.value_type, val));
+                        Ok(())
+                    })?;
                 }
             }
 
             let mut final_entries: Vec<(InternalKey, Vec<u8>)> = Vec::new();
             let mut dead_blobs: BTreeMap<u64, (u64, u64)> = BTreeMap::new();
-            let mut oldest_blob = u64::MAX;
 
             for (ukey, mut versions) in by_user_key {
                 versions.sort_by_key(|v| std::cmp::Reverse(v.0));
@@ -824,16 +877,7 @@ impl Db {
                     if !kept_newest && !covered {
                         kept_newest = true;
                         match vtype {
-                            ValueType::Value => {
-                                final_entries
-                                    .push((InternalKey::new(ukey.clone(), seq, vtype), raw));
-                            }
-                            ValueType::BlobIndex => {
-                                if let Ok(BlobIndex::Blob { file_number, .. }) =
-                                    BlobIndex::decode(&raw)
-                                {
-                                    oldest_blob = oldest_blob.min(file_number);
-                                }
+                            ValueType::Value | ValueType::BlobIndex => {
                                 final_entries
                                     .push((InternalKey::new(ukey.clone(), seq, vtype), raw));
                             }
@@ -861,72 +905,51 @@ impl Db {
             } else {
                 merged_rdels
             };
-            let oldest_blob_in_new_sst = if oldest_blob == u64::MAX {
-                0
-            } else {
-                oldest_blob
-            };
 
             (
                 cf.id,
                 cf.next_epoch,
-                is_bottommost,
                 selected_l1_nums,
+                unselected_l1_starts,
                 deleted_ssts,
                 final_entries,
                 final_rdels,
                 dead_blobs,
-                oldest_blob_in_new_sst,
             )
         };
-        let _ = is_bottommost;
 
-        let mut new_sst_meta = None;
-        if !final_entries.is_empty() || !final_rdels.is_empty() {
-            let sst_num = self.next_file_number;
-            self.next_file_number += 1;
-            let built = sst_writer::write_sst(
-                &self.dir,
-                sst_num,
-                cf_id,
-                cf_name,
-                &final_entries,
-                &final_rdels,
-                oldest_blob_in_new_sst,
-            )?;
-            new_sst_meta = Some(SstFileMeta {
-                number: built.file_number,
-                level: 1,
-                file_size: built.file_size,
-                smallest: built.smallest,
-                largest: built.largest,
-                smallest_seqno: built.smallest_seqno,
-                largest_seqno: built.largest_seqno,
-                oldest_blob_file_number: built.oldest_blob_file_number,
-                epoch_number: epoch,
-            });
-        }
+        let new_sst_metas = self.write_split_l1_ssts(
+            cf_id,
+            cf_name,
+            epoch,
+            &final_entries,
+            &final_rdels,
+            &unselected_l1_starts,
+        )?;
 
         let mut edit = VersionEditBuilder {
             column_family: cf_id,
             next_file_number: Some(self.next_file_number),
             last_sequence: Some(self.last_sequence),
             deleted_files: deleted_ssts.clone(),
-            new_files: new_sst_meta.iter().cloned().collect(),
+            new_files: new_sst_metas.clone(),
             ..Default::default()
         };
         for (&bnum, &(gc, gb)) in &dead_blobs {
             edit.blob_garbages.push((bnum, gc, gb));
         }
-        manifest_writer::append_edits(&self.dir, &self.manifest_name, &[edit])?;
+        manifest_writer::append_edits_with_sync(
+            &self.dir,
+            &self.manifest_name,
+            &[edit],
+            self.sync_on_flush,
+        )?;
 
-        let new_opened = match new_sst_meta {
-            Some(meta) => {
-                let reader = SstReader::open(&self.dir.join(format!("{:06}.sst", meta.number)))?;
-                Some(OpenedSst { meta, reader })
-            }
-            None => None,
-        };
+        let mut new_opened = Vec::with_capacity(new_sst_metas.len());
+        for meta in new_sst_metas {
+            let reader = SstReader::open(&self.dir.join(format!("{:06}.sst", meta.number)))?;
+            new_opened.push(OpenedSst { meta, reader });
+        }
 
         let dead_blob_files: Vec<u64> = {
             let cf = self.cfs.get_mut(cf_name).unwrap();
@@ -935,11 +958,8 @@ impl Db {
                 cf.levels.resize_with(2, Vec::new);
             }
             cf.levels[1].retain(|s| !selected_l1_nums.contains(&s.meta.number));
-            if let Some(opened) = new_opened {
-                cf.levels[1].push(opened);
-                cf.levels[1]
-                    .sort_by(|a, b| a.meta.smallest.user_key.cmp(&b.meta.smallest.user_key));
-            }
+            cf.levels[1].extend(new_opened);
+            cf.levels[1].sort_by(|a, b| a.meta.smallest.user_key.cmp(&b.meta.smallest.user_key));
             cf.next_epoch += 1;
 
             for (&bnum, &(gc, gb)) in &dead_blobs {
@@ -949,21 +969,11 @@ impl Db {
                 }
             }
 
-            let min_live_blob = cf
-                .levels
-                .iter()
-                .flatten()
-                .filter(|s| s.meta.oldest_blob_file_number != 0)
-                .map(|s| s.meta.oldest_blob_file_number)
-                .min();
             let unreferenced: Vec<u64> = cf
                 .blob_files
                 .iter()
-                .filter(|(bnum, m)| {
-                    let all_garb =
-                        m.garbage_blob_count >= m.total_blob_count && m.total_blob_count > 0;
-                    let older_than_live = min_live_blob.is_none_or(|min_b| **bnum < min_b);
-                    all_garb && older_than_live
+                .filter(|(_, m)| {
+                    m.garbage_blob_count >= m.total_blob_count && m.total_blob_count > 0
                 })
                 .map(|(bnum, _)| *bnum)
                 .collect();
@@ -1051,13 +1061,14 @@ impl Db {
             for (lvl_idx, lvl) in cf.levels.iter().enumerate() {
                 for sst in lvl {
                     deleted_ssts.push((lvl_idx as u32, sst.meta.number));
-                    for entry in sst.reader.scan_range(None, None)? {
-                        let parsed = ParsedInternalKey::parse(&entry.internal_key)?;
+                    sst.reader.for_each_entry(|ikey, val| {
+                        let parsed = ParsedInternalKey::parse(&ikey)?;
                         by_user_key
                             .entry(parsed.user_key.to_vec())
                             .or_default()
-                            .push((parsed.seqno, parsed.value_type, entry.value));
-                    }
+                            .push((parsed.seqno, parsed.value_type, val));
+                        Ok(())
+                    })?;
                 }
             }
             if deleted_ssts.is_empty() {
@@ -1099,9 +1110,12 @@ impl Db {
             (cf.id, deleted_ssts, live_entries, dead_blobs, cf.next_epoch)
         };
 
-        // Decide whether to relocate live blobs.
-        let mut do_relocate = relocate_blobs;
-        if !do_relocate {
+        // Decide which blob files to relocate. When `relocate_blobs` is explicitly requested,
+        // relocate every surviving blob; when auto-triggered by >= 25% garbage, only relocate
+        // blobs belonging to files that actually carry garbage so 0%-garbage files are never
+        // re-read and rewritten during routine cache eviction.
+        let mut relocate_set: HashSet<u64> = HashSet::new();
+        if !relocate_blobs {
             let cf = self.cf(cf_name)?;
             let projected_live: u64 = cf
                 .blob_files
@@ -1128,7 +1142,13 @@ impl Db {
                 })
                 .sum();
             if projected_live > 0 && projected_garb.saturating_mul(4) >= projected_live {
-                do_relocate = true;
+                for b in cf.blob_files.values() {
+                    let add_g = dead_blobs.get(&b.number).map_or(0, |x| x.0);
+                    let total_g = b.garbage_blob_count.saturating_add(add_g);
+                    if total_g > 0 && total_g < b.total_blob_count {
+                        relocate_set.insert(b.number);
+                    }
+                }
             }
         }
 
@@ -1136,7 +1156,6 @@ impl Db {
         let mut new_blob_writer: Option<BlobFileWriter> = None;
         let mut finished_new_blobs = Vec::new();
         let mut all_garbage = dead_blobs;
-        let mut oldest_blob = u64::MAX;
 
         for (ik, raw) in live_entries {
             if ik.value_type == ValueType::BlobIndex {
@@ -1147,9 +1166,8 @@ impl Db {
                     compression,
                 } = BlobIndex::decode(&raw)?
                 {
-                    if do_relocate {
-                        let val = blob::read_blob_value(
-                            &self.dir,
+                    if relocate_blobs || relocate_set.contains(&file_number) {
+                        let val = self.read_blob_cached(
                             &ik.user_key,
                             file_number,
                             offset,
@@ -1159,7 +1177,12 @@ impl Db {
                         if let Some(bw) = new_blob_writer.as_ref()
                             && bw.current_bytes() >= self.blob_file_size
                         {
-                            finished_new_blobs.push(new_blob_writer.take().unwrap().finish()?);
+                            finished_new_blobs.push(
+                                new_blob_writer
+                                    .take()
+                                    .unwrap()
+                                    .finish_with_sync(self.sync_on_flush)?,
+                            );
                         }
                         if new_blob_writer.is_none() {
                             let new_blob_num = self.next_file_number;
@@ -1172,7 +1195,6 @@ impl Db {
                         let (new_off, new_sz) = bw.add_blob(&ik.user_key, &val)?;
                         let new_idx =
                             blob::encode_blob_index(bnum, new_off, new_sz, CompressionType::None);
-                        oldest_blob = oldest_blob.min(bnum);
                         final_entries.push((ik.clone(), new_idx));
 
                         // Mark old blob record as garbage.
@@ -1181,7 +1203,6 @@ impl Db {
                         e.0 += 1;
                         e.1 += rec_bytes;
                     } else {
-                        oldest_blob = oldest_blob.min(file_number);
                         final_entries.push((ik, raw));
                     }
                 } else {
@@ -1193,46 +1214,18 @@ impl Db {
         }
 
         if let Some(bw) = new_blob_writer {
-            finished_new_blobs.push(bw.finish()?);
+            finished_new_blobs.push(bw.finish_with_sync(self.sync_on_flush)?);
         }
-        let oldest_blob_file_number = if oldest_blob == u64::MAX {
-            0
-        } else {
-            oldest_blob
-        };
 
-        let mut new_sst_meta = None;
-        if !final_entries.is_empty() {
-            let sst_num = self.next_file_number;
-            self.next_file_number += 1;
-            let built = sst_writer::write_sst(
-                &self.dir,
-                sst_num,
-                cf_id,
-                cf_name,
-                &final_entries,
-                &[],
-                oldest_blob_file_number,
-            )?;
-            new_sst_meta = Some(SstFileMeta {
-                number: built.file_number,
-                level: 1,
-                file_size: built.file_size,
-                smallest: built.smallest,
-                largest: built.largest,
-                smallest_seqno: built.smallest_seqno,
-                largest_seqno: built.largest_seqno,
-                oldest_blob_file_number: built.oldest_blob_file_number,
-                epoch_number: epoch,
-            });
-        }
+        let new_sst_metas =
+            self.write_split_l1_ssts(cf_id, cf_name, epoch, &final_entries, &[], &[])?;
 
         let mut edit = VersionEditBuilder {
             column_family: cf_id,
             next_file_number: Some(self.next_file_number),
             last_sequence: Some(self.last_sequence),
             deleted_files: deleted_ssts.clone(),
-            new_files: new_sst_meta.iter().cloned().collect(),
+            new_files: new_sst_metas.clone(),
             ..Default::default()
         };
         for bs in &finished_new_blobs {
@@ -1242,16 +1235,19 @@ impl Db {
         for (&bnum, &(gc, gb)) in &all_garbage {
             edit.blob_garbages.push((bnum, gc, gb));
         }
-        manifest_writer::append_edits(&self.dir, &self.manifest_name, &[edit])?;
+        manifest_writer::append_edits_with_sync(
+            &self.dir,
+            &self.manifest_name,
+            &[edit],
+            self.sync_on_flush,
+        )?;
 
         // Update in-memory state and unlink obsolete SSTs & fully-dead .blob files.
-        let new_opened = match new_sst_meta {
-            Some(meta) => {
-                let reader = SstReader::open(&self.dir.join(format!("{:06}.sst", meta.number)))?;
-                Some(OpenedSst { meta, reader })
-            }
-            None => None,
-        };
+        let mut new_opened = Vec::with_capacity(new_sst_metas.len());
+        for meta in new_sst_metas {
+            let reader = SstReader::open(&self.dir.join(format!("{:06}.sst", meta.number)))?;
+            new_opened.push(OpenedSst { meta, reader });
+        }
 
         let dead_blob_files: Vec<u64> = {
             let cf = self.cfs.get_mut(cf_name).unwrap();
@@ -1261,9 +1257,8 @@ impl Db {
             if cf.levels.len() < 2 {
                 cf.levels.resize_with(2, Vec::new);
             }
-            if let Some(opened) = new_opened {
-                cf.levels[1].push(opened);
-            }
+            cf.levels[1].extend(new_opened);
+            cf.levels[1].sort_by(|a, b| a.meta.smallest.user_key.cmp(&b.meta.smallest.user_key));
             cf.next_epoch += 1;
             for bs in finished_new_blobs {
                 cf.blob_files.insert(
@@ -1286,12 +1281,8 @@ impl Db {
             let unreferenced: Vec<u64> = cf
                 .blob_files
                 .iter()
-                .filter(|(bnum, m)| {
-                    let all_garb =
-                        m.garbage_blob_count >= m.total_blob_count && m.total_blob_count > 0;
-                    let older_than_live =
-                        oldest_blob_file_number == 0 || **bnum < oldest_blob_file_number;
-                    all_garb && older_than_live
+                .filter(|(_, m)| {
+                    m.garbage_blob_count >= m.total_blob_count && m.total_blob_count > 0
                 })
                 .map(|(bnum, _)| *bnum)
                 .collect();
@@ -1456,27 +1447,13 @@ impl Db {
                     offset,
                     size,
                     compression,
-                } => {
-                    let reader = {
-                        let mut cache = self.blob_readers.lock().unwrap();
-                        if let Some(r) = cache.get(&file_number) {
-                            Arc::clone(r)
-                        } else {
-                            if cache.len() >= 32 {
-                                cache.clear();
-                            }
-                            let r = Arc::new(BlobFileReader::open(&self.dir, file_number)?);
-                            cache.insert(file_number, Arc::clone(&r));
-                            r
-                        }
-                    };
-                    Ok(Some(reader.read_value(
-                        user_key,
-                        offset,
-                        size,
-                        compression,
-                    )?))
-                }
+                } => Ok(Some(self.read_blob_cached(
+                    user_key,
+                    file_number,
+                    offset,
+                    size,
+                    compression,
+                )?)),
             },
             other => Err(Error::Unsupported(format!(
                 "unsupported value type {other:?}"
@@ -1484,10 +1461,160 @@ impl Db {
         }
     }
 
+    fn read_blob_cached(
+        &self,
+        user_key: &[u8],
+        file_number: u64,
+        offset: u64,
+        size: u64,
+        compression: CompressionType,
+    ) -> Result<Vec<u8>> {
+        let reader = {
+            let mut cache = self.blob_readers.lock().unwrap();
+            if let Some(r) = cache.get(&file_number) {
+                Arc::clone(r)
+            } else {
+                if cache.len() >= 32 {
+                    cache.clear();
+                }
+                let r = Arc::new(BlobFileReader::open(&self.dir, file_number)?);
+                cache.insert(file_number, Arc::clone(&r));
+                r
+            }
+        };
+        reader.read_value(user_key, offset, size, compression)
+    }
+
     fn cf(&self, name: &str) -> Result<&ColumnFamilyEngine> {
         self.cfs
             .get(name)
             .ok_or_else(|| Error::NotFound(format!("column family {name:?} not found")))
+    }
+
+    /// Writes sorted `(InternalKey, Vec<u8>)` entries into one or more non-overlapping
+    /// L1 SSTs bounded by `self.target_sst_bytes` and split cleanly around any unselected
+    /// L1 SST ranges so RocksDB's non-overlapping L1 invariant is always preserved.
+    fn write_split_l1_ssts(
+        &mut self,
+        cf_id: u32,
+        cf_name: &str,
+        epoch: u64,
+        entries: &[(InternalKey, Vec<u8>)],
+        range_dels: &[RangeTombstone],
+        unselected_l1_starts: &[Vec<u8>],
+    ) -> Result<Vec<SstFileMeta>> {
+        if entries.is_empty() {
+            if range_dels.is_empty() {
+                return Ok(Vec::new());
+            }
+            let sst_num = self.next_file_number;
+            self.next_file_number += 1;
+            let built = sst_writer::write_sst_with_sync(
+                &self.dir,
+                sst_num,
+                cf_id,
+                cf_name,
+                &[],
+                range_dels,
+                0,
+                self.sync_on_flush,
+            )?;
+            return Ok(vec![SstFileMeta {
+                number: built.file_number,
+                level: 1,
+                file_size: built.file_size,
+                smallest: built.smallest,
+                largest: built.largest,
+                smallest_seqno: built.smallest_seqno,
+                largest_seqno: built.largest_seqno,
+                oldest_blob_file_number: built.oldest_blob_file_number,
+                epoch_number: epoch,
+            }]);
+        }
+
+        let mut metas = Vec::new();
+        let mut start = 0usize;
+        let mut shard_bytes = 0usize;
+        let mut barrier_idx = unselected_l1_starts
+            .partition_point(|b| b.as_slice() <= entries[0].0.user_key.as_slice());
+
+        for i in 0..entries.len() {
+            let entry_bytes = entries[i].0.user_key.len() + 8 + entries[i].1.len();
+            if i > start && entries[i].0.user_key != entries[i - 1].0.user_key {
+                let crossed_barrier = unselected_l1_starts
+                    .get(barrier_idx)
+                    .is_some_and(|b| b.as_slice() < entries[i].0.user_key.as_slice());
+                if shard_bytes >= self.target_sst_bytes || crossed_barrier {
+                    metas.push(self.emit_l1_shard(
+                        cf_id,
+                        cf_name,
+                        epoch,
+                        &entries[start..i],
+                        range_dels,
+                    )?);
+                    start = i;
+                    shard_bytes = 0;
+                    while unselected_l1_starts
+                        .get(barrier_idx)
+                        .is_some_and(|b| b.as_slice() <= entries[start].0.user_key.as_slice())
+                    {
+                        barrier_idx += 1;
+                    }
+                }
+            }
+            shard_bytes += entry_bytes;
+        }
+        metas.push(self.emit_l1_shard(cf_id, cf_name, epoch, &entries[start..], range_dels)?);
+        Ok(metas)
+    }
+
+    fn emit_l1_shard(
+        &mut self,
+        cf_id: u32,
+        cf_name: &str,
+        epoch: u64,
+        shard: &[(InternalKey, Vec<u8>)],
+        range_dels: &[RangeTombstone],
+    ) -> Result<SstFileMeta> {
+        let mut oldest_blob = u64::MAX;
+        for (ik, raw) in shard {
+            if ik.value_type == ValueType::BlobIndex
+                && let Ok(BlobIndex::Blob { file_number, .. }) = BlobIndex::decode(raw)
+            {
+                oldest_blob = oldest_blob.min(file_number);
+            }
+        }
+        let oldest_blob = if oldest_blob == u64::MAX { 0 } else { oldest_blob };
+        let shard_lo = shard.first().unwrap().0.user_key.as_slice();
+        let shard_hi = shard.last().unwrap().0.user_key.as_slice();
+        let shard_rdels: Vec<RangeTombstone> = range_dels
+            .iter()
+            .filter(|rd| rd.end.as_slice() >= shard_lo && rd.start.as_slice() <= shard_hi)
+            .cloned()
+            .collect();
+        let sst_num = self.next_file_number;
+        self.next_file_number += 1;
+        let built = sst_writer::write_sst_with_sync(
+            &self.dir,
+            sst_num,
+            cf_id,
+            cf_name,
+            shard,
+            &shard_rdels,
+            oldest_blob,
+            self.sync_on_flush,
+        )?;
+        Ok(SstFileMeta {
+            number: built.file_number,
+            level: 1,
+            file_size: built.file_size,
+            smallest: built.smallest,
+            largest: built.largest,
+            smallest_seqno: built.smallest_seqno,
+            largest_seqno: built.largest_seqno,
+            oldest_blob_file_number: built.oldest_blob_file_number,
+            epoch_number: epoch,
+        })
     }
 }
 

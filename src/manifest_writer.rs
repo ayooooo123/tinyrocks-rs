@@ -157,6 +157,17 @@ pub fn append_edits(
     manifest_name: &str,
     edits: &[VersionEditBuilder],
 ) -> Result<()> {
+    append_edits_with_sync(db_dir, manifest_name, edits, true)
+}
+
+/// Same as [`append_edits`], with caller-controlled fsync (`sync = false` writes
+/// through the OS page cache without `F_FULLFSYNC` on routine cache flushes).
+pub fn append_edits_with_sync(
+    db_dir: &Path,
+    manifest_name: &str,
+    edits: &[VersionEditBuilder],
+    sync: bool,
+) -> Result<()> {
     let path = db_dir.join(manifest_name);
     let file = OpenOptions::new().create(true).append(true).open(&path)?;
     let initial_len = file.metadata()?.len() as usize;
@@ -166,8 +177,10 @@ pub fn append_edits(
     }
     lw.flush()?;
     let file = lw.into_inner();
-    file.sync_data()?;
-    sync_dir(db_dir);
+    if sync {
+        file.sync_data()?;
+        sync_dir(db_dir);
+    }
     Ok(())
 }
 
